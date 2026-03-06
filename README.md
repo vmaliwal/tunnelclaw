@@ -25,7 +25,7 @@
 
 ---
 
-[![Works with Pi](https://img.shields.io/badge/Works%20with-Pi-blueviolet?style=flat-square)](https://github.com/mariozechner/pi-coding-agent)
+[![Works with Pi](https://img.shields.io/badge/Works%20with-Pi-blueviolet?style=flat-square)](https://github.com/mariozechner/pi)
 [![Works with Claude Code](https://img.shields.io/badge/Works%20with-Claude%20Code-orange?style=flat-square)](https://claude.ai/code)
 [![Works with Codex](https://img.shields.io/badge/Works%20with-OpenAI%20Codex-412991?style=flat-square)](https://openai.com/codex)
 [![Works with Cursor](https://img.shields.io/badge/Works%20with-Cursor-1a1a2e?style=flat-square)](https://cursor.sh)
@@ -230,8 +230,6 @@ skills/chrome-cdp-relay/
 ---
 
 <div align="center">
-
-Built with 🦀 in the [cowork-supercharged](https://github.com/mariozechner/pi-coding-agent) ecosystem.
 
 *A tunnel. A claw. A real browser for your remote agent.*
 

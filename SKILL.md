@@ -158,10 +158,79 @@ targets = requests.get('http://127.0.0.1:9223/json').json()
 
 ---
 
+## Recovery: Restart CDP Relay
+
+When Playwright reports `connectOverCDP: Timeout exceeded` but `curl /json/version` still returns 200, the Chrome process has a **stale WebSocket state** — the browser GUID changed (Chrome auto-updated or crashed) but the old process lingers with a broken CDP session.
+
+> **Key insight:** HTTP health checks (`/json/version`) can return 200 even when WebSocket CDP is completely broken. Always verify with an actual Playwright `connectOverCDP` call, not just curl.
+
+### Quick restart (run on Mac):
+
+```bash
+# 1. Kill stale Chrome debug instance
+pkill -f "remote-debugging-port={LOCAL_CDP_PORT}"
+sleep 2
+
+# 2. Restart Chrome via launchd
+launchctl unload ~/Library/LaunchAgents/com.openclaw.chrome-debug-{PROFILE_NAME}.plist
+sleep 1
+launchctl load ~/Library/LaunchAgents/com.openclaw.chrome-debug-{PROFILE_NAME}.plist
+sleep 3
+
+# 3. Verify new Chrome is up with fresh GUID
+curl -s http://127.0.0.1:{LOCAL_CDP_PORT}/json/version
+```
+
+### Full restart (Chrome + tunnel):
+
+```bash
+# Kill everything
+pkill -f "remote-debugging-port={LOCAL_CDP_PORT}"
+pkill -f "autossh.*{REMOTE_CDP_PORT}"
+sleep 2
+
+# Reload both launchd agents
+launchctl unload ~/Library/LaunchAgents/com.openclaw.chrome-debug-{PROFILE_NAME}.plist 2>/dev/null
+launchctl unload ~/Library/LaunchAgents/com.openclaw.chrome-tunnel-{PROFILE_NAME}.plist 2>/dev/null
+sleep 1
+launchctl load ~/Library/LaunchAgents/com.openclaw.chrome-debug-{PROFILE_NAME}.plist
+launchctl load ~/Library/LaunchAgents/com.openclaw.chrome-tunnel-{PROFILE_NAME}.plist
+sleep 3
+
+# Verify end-to-end (from remote)
+ssh {REMOTE_USER}@{REMOTE_HOST} 'curl -s http://127.0.0.1:{REMOTE_CDP_PORT}/json/version'
+```
+
+### Verify with actual Playwright (not just curl):
+
+```bash
+# Run this on the remote server — curl alone is NOT sufficient
+node -e "
+const { chromium } = require('playwright');
+(async () => {
+  const browser = await chromium.connectOverCDP('http://127.0.0.1:{REMOTE_CDP_PORT}', {timeout: 10000});
+  console.log('CDP OK, contexts:', browser.contexts().length);
+  browser.close();
+})().catch(e => { console.log('FAILED:', e.message.slice(0,200)); process.exit(1); });
+"
+```
+
+### Common cause: duplicate tunnels
+
+Check for multiple autossh processes forwarding the same port:
+```bash
+ps aux | grep autossh | grep {REMOTE_CDP_PORT}
+```
+If more than one exists (e.g. one from launchd + one manual), kill the extras. Duplicate tunnels cause WebSocket frame corruption.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
+| **Playwright timeout but curl /json/version works** | **Stale Chrome GUID / broken WebSocket** | **Restart Chrome: `pkill -f remote-debugging-port` then reload launchd** |
+| **Duplicate autossh processes** | **Manual + launchd tunnel both running** | **Kill manual one, keep launchd-managed** |
 | Local curl returns nothing | Chrome not started | Check log: `tail /tmp/openclaw-chrome-debug-{PROFILE_NAME}.err.log` |
 | Remote curl hangs/refused | Tunnel not up yet | Check: `tail /tmp/openclaw-autossh-{PROFILE_NAME}.err.log` |
 | Remote curl: connection refused | `GatewayPorts` not set | Add `GatewayPorts yes` to remote `/etc/ssh/sshd_config`, restart sshd |

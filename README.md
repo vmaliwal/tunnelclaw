@@ -119,6 +119,12 @@ That's it. The script checks prerequisites, creates the Chrome profile, generate
 - **autossh**: `brew install autossh`
 - **SSH key** with access to the remote server
 - **Remote sshd** with `GatewayPorts yes` in `/etc/ssh/sshd_config`
+- **Remote sshd keepalive** — ensure `/etc/ssh/sshd_config` has:
+  ```
+  ClientAliveInterval 15
+  ClientAliveCountMax 3
+  ```
+  Without this, dead SSH sessions hold the forwarded port for 15+ minutes, blocking reconnection. After adding, run `systemctl reload ssh`.
 
 ---
 
@@ -154,6 +160,76 @@ print(targets[0]['webSocketDebuggerUrl'])
 curl http://127.0.0.1:9223/json/version
 # → {"Browser": "Chrome/124.0.0.0", "Protocol-Version": "1.3", ...}
 ```
+
+---
+
+## ⚠️ Concurrent CDP Connections
+
+Chrome's DevTools Protocol handles one active debugging session well, but **multiple simultaneous Playwright/Puppeteer connections can crash Chrome** or cause `Target page, context or browser has been closed` errors.
+
+If your agent runs frequent automated tasks (e.g., multiple times per hour), use this pattern:
+
+**Serial Queue + New Tab per Task + Close Tab After**
+
+- Only ONE Playwright `connectOverCDP` connection at a time
+- Each task gets a fresh tab (`context.newPage()`), closed after completion
+- Chrome stays running — no restart overhead
+- Concurrent triggers wait in a queue instead of all connecting simultaneously
+
+Reference implementation:
+
+```js
+// cdp-queue.mjs — Serial CDP connection queue
+import { chromium } from 'playwright';
+
+const CDP_ENDPOINT = 'http://127.0.0.1:{REMOTE_CDP_PORT}';
+const queue = [];
+let running = false;
+
+export async function withBrowser(fn) {
+  return new Promise((resolve, reject) => {
+    queue.push({ fn, resolve, reject });
+    processQueue();
+  });
+}
+
+async function processQueue() {
+  if (running || queue.length === 0) return;
+  running = true;
+  const { fn, resolve, reject } = queue.shift();
+  let browser;
+  try {
+    browser = await chromium.connectOverCDP(CDP_ENDPOINT, { timeout: 15000 });
+    const context = browser.contexts()[0];
+    const page = await context.newPage();
+    try {
+      const result = await fn(page);
+      resolve(result);
+    } finally {
+      await page.close().catch(() => {});
+    }
+  } catch (err) {
+    reject(err);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    running = false;
+    processQueue();
+  }
+}
+```
+
+Usage:
+```js
+import { withBrowser } from './cdp-queue.mjs';
+
+const result = await withBrowser(async (page) => {
+  await page.goto('https://example.com');
+  // ... interact with page ...
+  return extractedData;
+});
+```
+
+> **Important:** `browser.close()` after `connectOverCDP` only disconnects the Playwright WebSocket — it does NOT kill Chrome. Chrome stays running for the next queued task.
 
 ---
 
@@ -211,6 +287,8 @@ Sleep guard prevents macOS sleep whenever Chrome is running.
 | Remote curl hangs | Add `GatewayPorts yes` to remote `/etc/ssh/sshd_config`, restart sshd |
 | Chrome crashes on start | `lsof -i :9222` — kill conflicting process |
 | SSH key rejected | `chmod 600 ~/.ssh/id_ed25519` |
+| `remote port forwarding failed for listen port XXXX` | Set `ClientAliveInterval 15` + `ClientAliveCountMax 3` in remote `/etc/ssh/sshd_config` and `systemctl reload ssh`. Immediate fix: `ssh remote 'sudo fuser -k XXXX/tcp'` |
+| Multiple concurrent Playwright connections crash Chrome | Use a serial queue — see ⚠️ Concurrent CDP Connections section below |
 
 ---
 

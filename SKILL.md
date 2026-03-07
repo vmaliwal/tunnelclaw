@@ -50,6 +50,16 @@ Before running any setup steps, verify:
    # If missing or 'no', add it and: systemctl restart sshd
    ```
 
+5. **Remote sshd keepalive** — on the remote server:
+   ```bash
+   grep -E 'ClientAliveInterval|ClientAliveCountMax' /etc/ssh/sshd_config
+   # Should be:
+   #   ClientAliveInterval 15
+   #   ClientAliveCountMax 3
+   # If missing or commented out, add them and: systemctl reload ssh
+   ```
+   Without this, dead SSH sessions hold the forwarded port for 15+ minutes, blocking reconnection.
+
 ---
 
 ## Step-by-Step Setup
@@ -158,6 +168,76 @@ targets = requests.get('http://127.0.0.1:9223/json').json()
 
 ---
 
+## Concurrent CDP Connections
+
+Chrome's DevTools Protocol handles one active debugging session well, but **multiple simultaneous Playwright/Puppeteer connections can crash Chrome** or cause `Target page, context or browser has been closed` errors.
+
+If your agent runs frequent automated tasks (e.g., multiple times per hour), use this pattern:
+
+**Serial Queue + New Tab per Task + Close Tab After**
+
+- Only ONE Playwright `connectOverCDP` connection at a time
+- Each task gets a fresh tab (`context.newPage()`), closed after completion
+- Chrome stays running — no restart overhead
+- Concurrent triggers wait in a queue instead of all connecting simultaneously
+
+Reference implementation:
+
+```js
+// cdp-queue.mjs — Serial CDP connection queue
+import { chromium } from 'playwright';
+
+const CDP_ENDPOINT = 'http://127.0.0.1:{REMOTE_CDP_PORT}';
+const queue = [];
+let running = false;
+
+export async function withBrowser(fn) {
+  return new Promise((resolve, reject) => {
+    queue.push({ fn, resolve, reject });
+    processQueue();
+  });
+}
+
+async function processQueue() {
+  if (running || queue.length === 0) return;
+  running = true;
+  const { fn, resolve, reject } = queue.shift();
+  let browser;
+  try {
+    browser = await chromium.connectOverCDP(CDP_ENDPOINT, { timeout: 15000 });
+    const context = browser.contexts()[0];
+    const page = await context.newPage();
+    try {
+      const result = await fn(page);
+      resolve(result);
+    } finally {
+      await page.close().catch(() => {});
+    }
+  } catch (err) {
+    reject(err);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    running = false;
+    processQueue();
+  }
+}
+```
+
+Usage:
+```js
+import { withBrowser } from './cdp-queue.mjs';
+
+const result = await withBrowser(async (page) => {
+  await page.goto('https://example.com');
+  // ... interact with page ...
+  return extractedData;
+});
+```
+
+> **Important:** `browser.close()` after `connectOverCDP` only disconnects the Playwright WebSocket — it does NOT kill Chrome. Chrome stays running for the next queued task.
+
+---
+
 ## Recovery: Restart CDP Relay
 
 When Playwright reports `connectOverCDP: Timeout exceeded` but `curl /json/version` still returns 200, the Chrome process has a **stale WebSocket state** — the browser GUID changed (Chrome auto-updated or crashed) but the old process lingers with a broken CDP session.
@@ -237,6 +317,8 @@ If more than one exists (e.g. one from launchd + one manual), kill the extras. D
 | Chrome crashes on start | Port already in use | `lsof -i :{LOCAL_CDP_PORT}` — kill the other process |
 | SSH key rejected | Wrong key or permissions | `chmod 600 {SSH_KEY_PATH}` |
 | autossh keeps restarting | SSH server not accepting keepalives | Verify `ServerAliveInterval` and remote sshd `TCPKeepAlive yes` |
+| `remote port forwarding failed for listen port XXXX` | Stale sshd process on remote still holds the port from a dead session | Set `ClientAliveInterval 15` + `ClientAliveCountMax 3` in remote `/etc/ssh/sshd_config` and `systemctl reload ssh`. Immediate fix: `ssh remote 'sudo fuser -k XXXX/tcp'` |
+| Multiple concurrent Playwright connections crash Chrome | Too many simultaneous CDP WebSocket connections | Use a serial queue — see Concurrent CDP Connections section |
 
 ---
 

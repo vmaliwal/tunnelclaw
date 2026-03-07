@@ -276,9 +276,51 @@ else
   warn "Also ensure GatewayPorts is not blocking on the remote sshd."
 fi
 
-# ─── remote sshd hint ─────────────────────────────────────────────────────────
+# ─── remote sshd hints ────────────────────────────────────────────────────────
 info "Tip: if remote curl fails, ensure /etc/ssh/sshd_config on ${REMOTE_HOST} has:"
 echo "       GatewayPorts yes   (or: GatewayPorts clientspecified)"
+
+# ─── remote sshd keepalive check ─────────────────────────────────────────────
+info "Checking remote sshd keepalive settings on ${REMOTE_HOST}..."
+KEEPALIVE_OK=true
+REMOTE_SSHD_CFG=$(ssh -i "$SSH_KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+  "${REMOTE_USER}@${REMOTE_HOST}" "cat /etc/ssh/sshd_config" 2>/dev/null) || REMOTE_SSHD_CFG=""
+
+if [[ -n "$REMOTE_SSHD_CFG" ]]; then
+  # Check ClientAliveInterval (uncommented, non-zero)
+  CAI=$(echo "$REMOTE_SSHD_CFG" | grep -E '^\s*ClientAliveInterval\s+[1-9]' || true)
+  CAC=$(echo "$REMOTE_SSHD_CFG" | grep -E '^\s*ClientAliveCountMax\s+[1-9]' || true)
+
+  if [[ -z "$CAI" ]] || [[ -z "$CAC" ]]; then
+    KEEPALIVE_OK=false
+    warn "Remote sshd missing keepalive settings — dead SSH sessions will hold"
+    warn "the forwarded port for 15+ minutes, causing 'remote port forwarding failed'."
+    echo ""
+    echo -e "  ${BOLD}Add to /etc/ssh/sshd_config on ${REMOTE_HOST}:${RESET}"
+    echo "    ClientAliveInterval 15"
+    echo "    ClientAliveCountMax 3"
+    echo ""
+    read -rp "  Configure these automatically? [y/N] " CONFIGURE_KEEPALIVE
+    if [[ "${CONFIGURE_KEEPALIVE,,}" == "y" ]]; then
+      ssh -i "$SSH_KEY" -o ConnectTimeout=5 "${REMOTE_USER}@${REMOTE_HOST}" bash -s <<'REMOTE_KEEPALIVE_EOF'
+        # Remove any existing (possibly commented) lines
+        sudo sed -i '/^\s*#\?\s*ClientAliveInterval/d' /etc/ssh/sshd_config
+        sudo sed -i '/^\s*#\?\s*ClientAliveCountMax/d' /etc/ssh/sshd_config
+        # Append correct values
+        echo "ClientAliveInterval 15" | sudo tee -a /etc/ssh/sshd_config >/dev/null
+        echo "ClientAliveCountMax 3" | sudo tee -a /etc/ssh/sshd_config >/dev/null
+        sudo systemctl reload ssh 2>/dev/null || sudo systemctl reload sshd 2>/dev/null || true
+REMOTE_KEEPALIVE_EOF
+      success "Remote sshd keepalive configured and reloaded"
+    else
+      warn "Skipped. You may see 'remote port forwarding failed' errors on reconnection."
+    fi
+  else
+    success "Remote sshd keepalive: ClientAliveInterval and ClientAliveCountMax set"
+  fi
+else
+  warn "Could not read remote sshd_config — check keepalive settings manually"
+fi
 
 # ─── sleep guard hint ─────────────────────────────────────────────────────────
 echo ""
